@@ -1,0 +1,493 @@
+---
+title: "Business Forecasting Midterm — Forecasting US Total Vehicle Sales (TOTALSA)"
+author: "yichun wang"
+date: "2025-11-10"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+  pdf_document:
+    toc: true
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.5, fig.align = "center")
+```
+
+# Introduction
+
+In this report we forecast **US Total Vehicle Sales (SAAR, millions)**, leveraging multiple time series methods to compare performance and generate a 12‑month outlook. The analysis follows the required structure:
+
+- Import Data
+- Plot & Inference
+- Central Tendency
+- Decomposition
+- Naïve Method
+- Simple Moving Averages
+- Simple Exponential Smoothing (SES)
+- Holt–Winters
+- Accuracy Summary
+- Conclusion
+
+# Import Data
+
+```{r}
+need <- function(pkgs){
+  to_install <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+  if(length(to_install)) install.packages(to_install, dependencies = TRUE)
+  invisible(lapply(pkgs, require, character.only = TRUE))
+}
+need(c("readr","dplyr","tidyr","lubridate","zoo","ggplot2","scales",
+       "quantmod","forecast","tseries","gridExtra","knitr","kableExtra"))
+```
+```{r}
+# Priority 1: local CSV (TOTALSA.csv)
+# The CSV is expected to have either columns like DATE, TOTALSA
+# or a single numeric column with monthly values and an accompanying DATE column.
+paths <- unique(na.omit(c(
+  "TOTALSA.csv",
+  "./data/TOTALSA.csv",
+  Sys.getenv("TOTALSA_CSV"),
+  "/mnt/data/TOTALSA.csv" # fallback for this exported notebook environment only
+)))
+
+df <- NULL
+for(p in paths){
+  if(!is.na(p) && file.exists(p)){
+    message("Using local file: ", p)
+    raw <- suppressMessages(readr::read_csv(p, show_col_types = FALSE))
+    df <- raw
+    break
+  }
+}
+
+if(is.null(df)){
+  message("Local CSV not found. Fetching from FRED via quantmod...")
+  suppressMessages(getSymbols("TOTALSA", src = "FRED"))
+  xt <- TOTALSA
+  df <- data.frame(
+    DATE = as.Date(index(xt)),
+    TOTALSA = as.numeric(xt$TOTALSA)
+  )
+}
+
+# Minimal cleaning / type handling
+df <- df %>%
+  rename(date = 1, value = 2) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date) %>%
+  filter(!is.na(value))
+
+# Convert to monthly ts
+startY <- year(min(df$date)); startM <- month(min(df$date))
+sales_ts <- ts(df$value, start = c(startY, startM), frequency = 12)
+
+# Handy objects
+sales_df <- data.frame(date = df$date, value = df$value)
+```
+# Plot and Inference
+
+```{r}
+p_series <- ggplot(sales_df, aes(x = date, y = value)) +
+  geom_line() +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "US Total Vehicle Sales (TOTALSA) — Monthly SAAR",
+       x = "Year", y = "Millions (SAAR)")
+p_series
+```
+**Observations:**
+From the time series plot of U.S. Total Vehicle Sales (TOTALSA), we observe a clear and repeating **seasonal pattern** within each year. Sales tend to rise and fall in a consistent cycle, indicating strong seasonality in automobile demand. 
+
+In addition, the overall level of sales shows periods of **growth followed by sharp declines**, suggesting the influence of major economic events. For example, large downward spikes typically correspond to economic downturns, industry supply disruptions, or consumer demand shocks. 
+
+The pattern of the seasonal peaks remains relatively stable in shape, meaning that while the magnitude of sales may change over time, the **seasonal timing of highs and lows remains consistent**. Overall, the data suggests:
+- **Strong and regular seasonality** in vehicle sales.
+- **Cyclical fluctuations** likely tied to broader economic conditions.
+- Periods of noticeable **volatility**, indicating sensitivity to macroeconomic events.
+
+# Central Tendency
+
+```{r}
+ct <- data.frame(
+  Min = min(sales_ts, na.rm = TRUE),
+  Q1 = as.numeric(quantile(sales_ts, 0.25, na.rm = TRUE)),
+  Median = median(sales_ts, na.rm = TRUE),
+  Mean = mean(sales_ts, na.rm = TRUE),
+  Q3 = as.numeric(quantile(sales_ts, 0.75, na.rm = TRUE)),
+  Max = max(sales_ts, na.rm = TRUE)
+) %>% round(3)
+
+ct %>%
+  knitr::kable(caption = "Summary Statistics — TOTALSA", align = "c") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+```{r boxplot}
+ggplot(sales_df, aes(x = "", y = value)) +
+  geom_boxplot() +
+  labs(title = "Boxplot — TOTALSA", x = "", y = "Millions (SAAR)")
+```
+**Summary Interpretation:**
+
+From the summary statistics, the median value of vehicle sales is approximately 15.94 million units, which is very close to the mean (15.61 million). This indicates that the distribution is fairly symmetric, without strong skewness. The interquartile range (IQR), from about 14.19 (Q1) to 16.97 (Q3), shows that most monthly sales values fall within a moderately narrow middle band.
+
+The boxplot highlights one noticeable low outlier near 9 million units. This aligns with known periods of economic stress, such as the 2020 pandemic, when auto sales dropped sharply due to supply chain disruptions and reduced consumer demand.
+
+Overall, the distribution suggests:
+- The majority of sales values are concentrated between roughly **14 to 17 million units**.
+- The market typically operates within a stable central range, with **only occasional extreme drops**.
+- The outlier likely corresponds to **a macroeconomic shock**, rather than random variation.
+
+# Decomposition
+
+```{r}
+# Classical decompositions
+dec_add <- decompose(sales_ts, type = "additive")
+dec_mul <- decompose(sales_ts, type = "multiplicative")
+
+# STL (robust)
+stl_fit <- stl(sales_ts, s.window = "periodic")
+
+# Plots
+plot(dec_add)      # no "main" here
+plot(dec_mul)      # no "main" here
+forecast::autoplot(stl_fit) + ggtitle("STL Decomposition — TOTALSA")
+```
+**Seasonality type (Additive vs Multiplicative):**  
+If seasonal amplitude scales with the level, prefer multiplicative; otherwise additive.
+
+```{r}
+# Monthly seasonal indices from multiplicative decomp (12 values)
+mon_names <- month.abb
+season_idx <- as.numeric(dec_mul$figure)
+season_tbl <- data.frame(Month = factor(mon_names, levels = mon_names),
+                         SeasonalIndex = season_idx) %>%
+  arrange(desc(SeasonalIndex))
+
+knitr::kable(season_tbl, digits = 3, caption = "Seasonal Indices (Multiplicative)") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+hi_row <- season_tbl[1, ]
+lo_row <- season_tbl[nrow(season_tbl), ]
+
+cat(sprintf("Highest month: %s (index = %.3f)\n",
+            as.character(hi_row$Month), hi_row$SeasonalIndex))
+
+cat(sprintf("Lowest month: %s (index = %.3f)\n",
+            as.character(lo_row$Month), lo_row$SeasonalIndex))
+```
+**Seasonally Adjusted Series (STL):**
+
+```{r}
+sa <- seasadj(stl_fit)
+autoplot(cbind(Actual = sales_ts, SeasonallyAdjusted = sa)) +
+  ggtitle("Actual vs Seasonally Adjusted (STL)") +
+  ylab("Millions (SAAR)")
+```
+**Summary Interpretation:**
+The decomposition of the time series shows a clear **seasonal pattern**, as the seasonal component repeats in a consistent yearly cycle. Based on the classical multiplicative decomposition, the seasonal monthly indices range from approximately 0.904 to 1.096, meaning that some months consistently exhibit higher or lower sales relative to the annual average.
+
+The seasonal indices indicate that **January has the highest seasonal index (1.096)**, meaning vehicle sales are typically above average in January. This is likely due to factors such as year-end dealer incentives carrying over, new model availability, and consumers making delayed purchases after the holiday period. In contrast, **February shows the lowest seasonal index (0.904)**, suggesting sales are typically below average. February is generally a shorter month with colder weather and fewer purchasing cycles, contributing to weaker consumer activity.
+
+Comparing the additive vs. multiplicative decompositions, the **multiplicative model is more appropriate**, because the **seasonal fluctuations scale proportionally with the level of the series** rather than remaining constant in magnitude.
+
+Finally, when we overlay the seasonally adjusted series with the original data, we observe that the adjusted series removes the recurring seasonal peaks and troughs, leaving behind broader cyclical and irregular movements. This confirms that the series’ monthly fluctuations are driven strongly by **seasonality**, but **the trend moves more gradually**, reflecting broader economic conditions rather than seasonal effects alone.
+
+# Naïve Method
+
+```{r}
+fit_naive <- naive(sales_ts, h = 12)
+autoplot(fit_naive) + ggtitle("Naïve Forecast — Next 12 Months") + ylab("Millions (SAAR)")
+
+acc_naive <- accuracy(fit_naive)
+knitr::kable(as.data.frame(acc_naive), digits = 4, caption = "Naïve — Accuracy") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+**Residual Diagnostics (Naïve):**
+
+```{r}
+res_n <- residuals(fit_naive)
+p_n1 <- autoplot(res_n) + ggtitle("Naïve — Residuals over Time") + xlab("Time") + ylab("Residuals")
+p_n2 <- ggplot(data.frame(res = as.numeric(res_n)), aes(x = res)) + geom_histogram(bins = 30) + ggtitle("Naïve — Residuals Histogram")
+p_n3 <- ggplot(data.frame(fitted = as.numeric(fitted(fit_naive)), resid = as.numeric(res_n)), aes(fitted, resid)) +
+  geom_point(alpha = .6) + ggtitle("Naïve — Fitted vs Residuals") + xlab("Fitted") + ylab("Residuals")
+p_n4 <- ggplot(data.frame(actual = as.numeric(sales_ts), resid = as.numeric(res_n)), aes(actual, resid)) +
+  geom_point(alpha = .6) + ggtitle("Naïve — Actual vs Residuals") + xlab("Actual") + ylab("Residuals")
+gridExtra::grid.arrange(p_n1, p_n2, p_n3, p_n4, nrow = 2)
+forecast::Acf(res_n, main = "Naïve — Residuals ACF")
+```
+### Residual Analysis (Naïve Method)
+
+The residuals over time show repeated positive and negative swings, indicating that the naïve model does not fully account for the underlying seasonal pattern in the data. The residual values do not appear randomly scattered around zero, suggesting that systematic structure remains in the errors.
+
+The histogram of the residuals is not centered clearly around zero and appears somewhat right-skewed. This implies that the naïve forecasts tend to under-estimate sales more often than they over-estimate them.
+
+The plots of fitted values vs. residuals and actual values vs. residuals show visible patterns rather than random scatter. This indicates that the model is missing predictable variation in the data and that the residuals are not independent of the level of the time series.
+
+The ACF plot of the residuals shows significant correlation at multiple lags. This is strong evidence that the naïve model fails to capture serial dependence and seasonality in the data. In other words, the remaining structure in the residuals could be exploited by a more sophisticated forecasting method.
+
+### Accuracy and Forecast
+
+The accuracy metrics for the naïve model (ME, RMSE, MAE, MAPE, etc.) indicate that the error magnitudes are relatively high compared to models that account for trend and seasonality. As expected, the naïve model simply projects the most recent observed value forward.
+
+The forecasted values for the next 12 months remain essentially flat, centered around the last observed sales level, with wide prediction intervals. This reflects high uncertainty and suggests that the naïve model provides limited predictive insight.
+
+### Summary of the Naïve Method
+
+- **Accuracy:** The naïve model performs poorly because it does not model trend or seasonality.
+- **One-year forecast:** The model predicts that future sales will stay roughly equal to the most recent observed value.
+- **Other observations:** The presence of strong autocorrelation in the residuals confirms that the naïve model is **not appropriate** for this time series, which clearly exhibits strong seasonal behavior.
+
+# Simple Moving Averages
+
+```{r}
+ma3 <- zoo::rollmean(sales_ts, k = 3, align = "right", fill = NA)
+ma6 <- zoo::rollmean(sales_ts, k = 6, align = "right", fill = NA)
+ma9 <- zoo::rollmean(sales_ts, k = 9, align = "right", fill = NA)
+
+ma_df <- data.frame(
+  date = sales_df$date,
+  Actual = as.numeric(sales_ts),
+  MA3 = as.numeric(ma3),
+  MA6 = as.numeric(ma6),
+  MA9 = as.numeric(ma9)
+)
+
+ggplot(ma_df, aes(date, Actual)) +
+  geom_line() +
+  geom_line(aes(y = MA3), size = 0.7, alpha = 0.9, color = "red") +
+  geom_line(aes(y = MA6), size = 0.7, alpha = 0.9, color = "blue") +
+  geom_line(aes(y = MA9), size = 0.7, alpha = 0.9, color = "darkgreen") +
+  labs(title = "Simple Moving Averages (3=Red, 6=Blue, 9=Green)", x = "Year", y = "Millions (SAAR)")
+```
+```{r}
+# BONUS — Forecast Next 12 Months using MA(9)
+library(forecast)
+
+ma9 <- stats::filter(sales_ts, filter = rep(1/9, 9), sides = 2)
+last_ma9 <- tail(na.omit(ma9), 1)
+
+ma9_fc <- ts(rep(last_ma9, 12),
+             start = end(sales_ts) + c(0, 1),
+             frequency = frequency(sales_ts))
+
+autoplot(sales_ts, series = "Actual") +
+  autolayer(ma9, series = "MA(9)", color = "green") +
+  autolayer(ma9_fc, series = "MA(9) Forecast", color = "purple") +
+  ggtitle("Simple Moving Average (Order 9) — Forecast for Next 12 Months") +
+  ylab("Millions (SAAR)") + xlab("Year")
+```
+
+### Simple Moving Averages — Observations
+
+The simple moving averages smooth the fluctuations in the time series to different degrees depending on the window size. The **SMA(3)** (red line) still captures most of the short-term ups and downs, so it remains relatively close to the original data. The **SMA(6)** (blue line) is smoother and reduces more of the short-term noise, showing the underlying pattern more clearly. The **SMA(9)** (green line) is the smoothest of the three, capturing the long-term level of the series while removing most of the month-to-month variation.
+
+As the moving average order increases, the plot becomes **progressively smoother** and reacts more slowly to changes in the data. This demonstrates the trade-off between responsiveness and stability: smaller windows follow the data more closely, while larger windows highlight the underlying trend but lag the turning points.
+
+Based on the visual comparison, **SMA(6)** provides a balanced level of smoothing, as it reduces noise without losing important seasonal movements. Therefore, SMA(6) is a reasonable choice for forecasting among the three moving averages.
+
+# Simple Exponential Smoothing (SES)
+
+```{r}
+fit_ses <- ses(sales_ts, h = 12)
+autoplot(fit_ses) + ggtitle("SES Forecast — Next 12 Months") + ylab("Millions (SAAR)")
+
+alpha_ses <- tryCatch(fit_ses$model$par["alpha"], error = function(e) NA)
+init_level_ses <- tryCatch(fit_ses$model$states[1, "l"], error = function(e) NA)
+sigma_ses <- sd(residuals(fit_ses), na.rm = TRUE)
+
+data.frame(Parameter = c("alpha", "initial level", "sigma (resid sd)"),
+           Value = c(alpha_ses, init_level_ses, sigma_ses)) %>%
+  knitr::kable(digits = 4, caption = "SES — Parameters") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+acc_ses <- accuracy(fit_ses)
+knitr::kable(as.data.frame(acc_ses), digits = 4, caption = "SES — Accuracy") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+**Residual Diagnostics (SES):**
+
+```{r}
+res_s <- residuals(fit_ses)
+p_s1 <- autoplot(res_s) + ggtitle("SES — Residuals over Time") + xlab("Time") + ylab("Residuals")
+p_s2 <- ggplot(data.frame(res = as.numeric(res_s)), aes(x = res)) + geom_histogram(bins = 30) + ggtitle("SES — Residuals Histogram")
+p_s3 <- ggplot(data.frame(fitted = as.numeric(fitted(fit_ses)), resid = as.numeric(res_s)), aes(fitted, resid)) +
+  geom_point(alpha = .6) + ggtitle("SES — Fitted vs Residuals") + xlab("Fitted") + ylab("Residuals")
+p_s4 <- ggplot(data.frame(actual = as.numeric(sales_ts), resid = as.numeric(res_s)), aes(actual, resid)) +
+  geom_point(alpha = .6) + ggtitle("SES — Actual vs Residuals") + xlab("Actual") + ylab("Residuals")
+gridExtra::grid.arrange(p_s1, p_s2, p_s3, p_s4, nrow = 2)
+forecast::Acf(res_s, main = "SES — Residuals ACF")
+```
+### Simple Exponential Smoothing (SES)
+
+The SES model estimates a single smoothed level over time. The smoothing parameter **alpha (α)** controls how much weight is given to recent observations. In this model, α is relatively low, meaning the model gives more weight to the historical pattern and updates slowly when new values are observed. The **initial state** represents the starting level estimate at the beginning of the series, and **sigma (σ)** reflects the variability of the residuals.
+
+### Residual Analysis
+
+The residuals over time appear to fluctuate around zero, but still show noticeable recurring patterns. This suggests that the SES model does not fully capture the seasonality in the data. The histogram of residuals is centered near zero but shows some skewness, indicating that errors are not perfectly symmetric.
+
+The fitted values vs. residuals and actual values vs. residuals plots show structured patterns rather than random scatter. This implies that the residuals are not independent of the level of the series. The **ACF plot** of the residuals shows significant spikes at multiple lags, confirming that the model has **not fully removed autocorrelation**.
+
+Overall, the residual analysis indicates that SES is **not sufficient** for this time series because the data have strong seasonal components that SES cannot model.
+
+### Forecast and Interpretation
+
+The SES forecast for the next 12 months produces a nearly horizontal line at the estimated level of the series, with wide confidence intervals. This reflects the fact that SES assumes no seasonality or trend, and therefore predicts future values to remain close to the smoothed average.
+
+### Summary of SES Model
+
+- **How good is the accuracy?**  
+  The model accuracy is limited because SES does not account for seasonal effects, which are clearly present in the data.
+
+- **One-year forecast:**  
+  The model predicts that sales will remain around the long-run average level, with uncertainty increasing over time.
+
+- **Other observation:**  
+  The strong autocorrelation remaining in the residuals indicates that a **more advanced model (such as Holt-Winters)** is needed to account for both trend and seasonality.
+  
+# Holt–Winters
+
+```{r}
+fit_hw_add <- hw(sales_ts, seasonal = "additive", h = 12)
+fit_hw_mul <- hw(sales_ts, seasonal = "multiplicative", h = 12)
+
+rmse_add <- accuracy(fit_hw_add)[1, "RMSE"]
+rmse_mul <- accuracy(fit_hw_mul)[1, "RMSE"]
+fit_hw <- if (rmse_mul < rmse_add) fit_hw_mul else fit_hw_add
+form <- if (identical(fit_hw, fit_hw_mul)) "multiplicative" else "additive"
+
+autoplot(fit_hw) + ggtitle(paste0("Holt–Winters (", form, ") — Next 12 Months")) + ylab("Millions (SAAR)")
+
+alpha_hw <- tryCatch(fit_hw$model$par["alpha"], error = function(e) NA)
+beta_hw  <- tryCatch(fit_hw$model$par["beta"],  error = function(e) NA)
+gamma_hw <- tryCatch(fit_hw$model$par["gamma"], error = function(e) NA)
+init_l   <- tryCatch(fit_hw$model$states[1, "l"], error = function(e) NA)
+init_b   <- tryCatch(fit_hw$model$states[1, "b"], error = function(e) NA)
+sigma_hw <- sd(residuals(fit_hw), na.rm = TRUE)
+
+data.frame(Parameter = c("alpha","beta","gamma","initial level","initial trend","sigma (resid sd)"),
+           Value = c(alpha_hw, beta_hw, gamma_hw, init_l, init_b, sigma_hw)) %>%
+  knitr::kable(digits = 4, caption = paste("Holt–Winters (", form, ") — Parameters")) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+acc_hw <- accuracy(fit_hw)
+knitr::kable(as.data.frame(acc_hw), digits = 4, caption = paste("Holt–Winters (", form, ") — Accuracy")) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+**Residual Diagnostics (Holt–Winters):**
+
+```{r}
+res_h <- residuals(fit_hw)
+p_h1 <- autoplot(res_h) + ggtitle("HW — Residuals over Time") + xlab("Time") + ylab("Residuals")
+p_h2 <- ggplot(data.frame(res = as.numeric(res_h)), aes(x = res)) + geom_histogram(bins = 30) + ggtitle("HW — Residuals Histogram")
+p_h3 <- ggplot(data.frame(fitted = as.numeric(fitted(fit_hw)), resid = as.numeric(res_h)), aes(fitted, resid)) +
+  geom_point(alpha = .6) + ggtitle("HW — Fitted vs Residuals") + xlab("Fitted") + ylab("Residuals")
+p_h4 <- ggplot(data.frame(actual = as.numeric(sales_ts), resid = as.numeric(res_h)), aes(actual, resid)) +
+  geom_point(alpha = .6) + ggtitle("HW — Actual vs Residuals") + xlab("Actual") + ylab("Residuals")
+gridExtra::grid.arrange(p_h1, p_h2, p_h3, p_h4, nrow = 2)
+forecast::Acf(res_h, main = "HW — Residuals ACF")
+```
+# Forecast Tables (12 Months)
+
+```{r}
+fmt_fc <- function(fc){
+  data.frame(
+    Date = as.Date(time(fc$mean)),
+    Forecast = as.numeric(fc$mean),
+    Lo80 = as.numeric(fc$lower[,"80%"]),
+    Hi80 = as.numeric(fc$upper[,"80%"]),
+    Lo95 = as.numeric(fc$lower[,"95%"]),
+    Hi95 = as.numeric(fc$upper[,"95%"])
+  )
+}
+
+fc_naive <- fmt_fc(fit_naive)
+fc_ses   <- fmt_fc(fit_ses)
+fc_hw    <- fmt_fc(fit_hw)
+
+knitr::kable(head(fc_naive, 12), digits = 3, caption = "Naïve — 12‑Month Forecast") %>% kableExtra::kable_styling(full_width = FALSE)
+knitr::kable(head(fc_ses, 12),   digits = 3, caption = "SES — 12‑Month Forecast") %>% kableExtra::kable_styling(full_width = FALSE)
+knitr::kable(head(fc_hw, 12),    digits = 3, caption = paste("Holt–Winters (", form, ") — 12‑Month Forecast")) %>% kableExtra::kable_styling(full_width = FALSE)
+```
+### Holt-Winters Exponential Smoothing (Additive)
+
+The Holt-Winters model estimates three components: level, trend, and seasonality. The smoothing parameter **alpha (α)** controls how quickly the level updates; a moderate α suggests that the model balances recent observations with long-term structure. The **beta (β)** parameter, which updates the trend, is relatively small, indicating that the trend changes slowly over time. The **gamma (γ)** parameter controls the adjustment of seasonal effects and its non-zero value confirms the presence of recurring seasonal patterns in the data. The initial states for level, trend, and seasonality provide the starting values from which the model updates, and **sigma (σ)** represents the variability of the residuals.
+
+### Residual Analysis
+
+The residuals over time appear more stable than in the naïve and SES models, showing smaller swings and fewer extreme deviations. This indicates that the Holt-Winters model captures more of the structure in the time series. The histogram of the residuals is more symmetric and closer to being centered around zero, suggesting improved model fit.
+
+However, the fitted vs. residuals and actual vs. residuals plots still show some patterning, meaning that not all structure has been removed. The **ACF plot of the residuals** shows fewer significant spikes than the previous models, indicating that autocorrelation is reduced — but not completely eliminated. This means that Holt-Winters improves the fit substantially, although some remaining seasonality cycles and short-term dependencies are still present.
+
+### Forecast and Interpretation
+
+The 12-month forecast generated by the Holt-Winters model displays a **seasonal pattern** that closely follows the historical cycles observed in the data. This is a major improvement over SES, which produced a flat forecast with wide uncertainty. The forecast oscillates around a stable long-term sales level, with predictable rises and falls that match the seasonal peaks and troughs. The prediction intervals widen gradually, reflecting increasing uncertainty over time.
+
+### Summary of Holt-Winters Model
+
+- **How good is the accuracy?**  
+  The Holt-Winters model provides **stronger accuracy** than both the naïve method and SES because it incorporates both trend and seasonal adjustments.
+
+- **Forecast for next year:**  
+  The model predicts that sales will continue to follow the familiar seasonal pattern, maintaining a level consistent with recent historical averages.
+
+- **Other observation:**  
+  While some autocorrelation remains in the residuals, the Holt-Winters model **substantially improves fit** by capturing the seasonal structure that previous models failed to model.
+
+# Accuracy Summary
+
+```{r}
+acc_tbl <- dplyr::bind_rows(
+  data.frame(Model = "Naive", as.data.frame(t(acc_naive[1,]))),
+  data.frame(Model = "SES",   as.data.frame(t(acc_ses[1,]))),
+  data.frame(Model = paste("HW", form), as.data.frame(t(acc_hw[1,])))
+) %>%
+  dplyr::select(Model, ME, RMSE, MAE, MPE, MAPE, ACF1)
+
+knitr::kable(acc_tbl, digits = 4, caption = "Accuracy Summary") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+# Identify Best / Worst per metric
+best  <- sapply(names(acc_tbl)[-1], function(m) acc_tbl$Model[which.min(acc_tbl[[m]])])
+worst <- sapply(names(acc_tbl)[-1], function(m) acc_tbl$Model[which.max(acc_tbl[[m]])])
+
+data.frame(Metric = names(best), Best = unname(best), Worst = unname(worst)) %>%
+  knitr::kable(caption = "Best / Worst by Metric") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+**Overview of Forecasting Methods：**
+ 1. Naïve Method
+The Naïve method uses the most recent observation as the forecast for all future periods.
+- Why it is useful:
+It is a simple baseline model that allows us to compare more complex models against a minimal benchmark.
+ 
+ 2. Single Exponential Smoothing (SES)
+SES applies exponential smoothing to the level of the series, giving more weight to recent observations.
+- Why it is useful:
+It is effective when the series has no strong trend or seasonality, and it smooths out short-term noise.
+ 
+ 3. Holt–Winters Additive Model
+Holt–Winters captures level, trend, and seasonal components simultaneously.
+- Why it is useful:
+This method is designed for time series like TOTALSA that show repeated seasonal patterns and moderate trending behavior.
+ 
+# Conclusion
+
+The TOTALSA time series shows a repeating seasonal pattern along with small fluctuations around a relatively stable long-term level. Sales typically peak during certain months of the year and dip during others, which indicates predictable consumer or production seasonality in the auto market.
+
+Based on the forecasts generated, the Holt–Winters additive model projects that the time series will remain relatively stable over the next year, with sales continuing to fluctuate within the historical seasonal range (approximately 14 to 18 million units SAAR). There is no strong long-term upward or downward trend, so the series is expected to stay near its current level rather than significantly increase or decrease.
+Looking ahead two years, the model suggests a continuation of this same stable seasonal pattern, with no evidence of structural trend changes.
+
+**Expected Direction of the Series:**
+- Next 1 year: Expected to stay relatively flat, with normal seasonal ups and downs.
+- Next 2 years: The pattern is projected to remain consistent, again reflecting stable long-term demand in the auto market.
+
+**Ranking of Forecasting Methods:**
+1(Best):Holt-Winters Additive; 2: Single Exponential Smoothing(SES); 3(Worst): Naïve Method
